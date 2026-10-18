@@ -36,6 +36,8 @@ jobs:
           HITS="$(jq -r '.[] | select(.patch != null) | .filename as $f | .patch | split("\n")[] | select(startswith("+") and (startswith("+++")|not)) | select(test("AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----|AIza[0-9A-Za-z_-]{35}")) | $f' all.json | sort -u)"
           UNSCANNED="$(jq '[.[] | select(.patch == null)] | length' all.json)"
 
+          # Markdown backticks in the sed expression are intentional literals.
+          # shellcheck disable=SC2016
           section() { # title, list, ok-text
             if [ -n "$2" ]; then printf '**FLAG: %s**\n' "$1"; printf '%s\n' "$2" | sed 's/^/- `/; s/$/`/' | head -25; else printf 'OK: %s\n' "$3"; fi
             echo
