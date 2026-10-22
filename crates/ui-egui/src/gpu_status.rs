@@ -38,6 +38,96 @@ pub fn check(app: &mut PhotocraftApp, ctx: &egui::Context) {
     }
 }
 
+/// End-of-frame check of the device the window itself draws with (#3438). Once wgpu reports it
+/// lost (a driver reset, for example after the PC slept), egui-wgpu can't draw another frame: one
+/// with shapes panics creating its staging buffers (#1215), and one without leaves a frozen window
+/// whose close button opens an unsaved-changes prompt nobody can see. So this frame and every later
+/// one draw nothing; the first writes every unsaved document to crash recovery, waits for the
+/// writes, and closes the app without asking once all of them are saved. The next launch reopens
+/// the documents. If a write fails (a full disk, say) the app stays open with the documents in
+/// memory and tries again every [`RECOVERY_RETRY_SECS`]: closing would lose them.
+pub fn check_window(app: &mut PhotocraftApp, ctx: &egui::Context) {
+    let Some((device, health)) = app.window_device.as_ref() else { return };
+    // A loss while the app sat idle or the PC slept is noticed here, before the next frame.
+    health.probe(device);
+    if !health.device_lost() {
+        return;
+    }
+    ctx.graphics_mut(|g| *g = Default::default());
+    let now = ctx.input(|i| i.time);
+    if !app.window_lost {
+        app.window_lost = true;
+        let reason = health.fault().map_or_else(|| "GPU device lost".to_string(), |f| f.to_string());
+        log::error!("{reason}: the window can't be drawn any more; saving unsaved documents for recovery and closing");
+    } else {
+        match app.window_recovery_retry {
+            // Saved, and the close is on its way.
+            None => return,
+            Some(at) if now < at => {
+                ctx.request_repaint_after(std::time::Duration::from_secs_f64((at - now).max(0.0)));
+                return;
+            }
+            Some(_) => {}
+        }
+    }
+    match save_for_recovery(app) {
+        Ok(()) => {
+            app.window_recovery_retry = None;
+            app.allow_close = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        Err(e) => {
+            log::error!("{e}; keeping the documents open and trying again in {RECOVERY_RETRY_SECS} s");
+            app.window_recovery_retry = Some(now + RECOVERY_RETRY_SECS);
+            ctx.request_repaint_after(std::time::Duration::from_secs_f64(RECOVERY_RETRY_SECS));
+        }
+    }
+}
+
+/// Seconds between attempts to save unsaved work for recovery after the window's device was lost.
+pub const RECOVERY_RETRY_SECS: f64 = 2.0;
+
+/// Write every document with unsaved changes to crash recovery, whatever the autosave timer and
+/// preference, and wait until the writes finished (see `Services::flush_autosaves`). `Ok` only when
+/// each of them is known to be on disk.
+fn save_for_recovery(app: &mut PhotocraftApp) -> Result<(), String> {
+    let jobs: Vec<_> = app.session.documents().iter().filter(|d| d.is_dirty()).map(|d| (d.doc.clone(), d.revision, d.path.clone())).collect();
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    // (document id, why) for each document not known to be saved.
+    let mut failed: Vec<(u64, String)> = Vec::new();
+    let Some(save) = app.services.autosave.as_mut() else { return Err("no crash-recovery autosave".into()) };
+    for (doc, revision, path) in &jobs {
+        if let Err(e) = save(doc, *revision, path.as_deref()) {
+            failed.push((doc.id.0, format!("{}: {e}", doc.name)));
+        }
+    }
+    // Without a flush, only a service whose `autosave` reports the finished write can confirm it.
+    let outcomes = match app.services.flush_autosaves.as_mut() {
+        Some(flush) => flush(),
+        None if app.services.autosave_results.is_none() => Vec::new(),
+        None => return Err("crash-recovery autosaves can't be waited for".into()),
+    };
+    let confirm = app.services.flush_autosaves.is_some();
+    for (doc, revision, _) in &jobs {
+        if failed.iter().any(|(id, _)| *id == doc.id.0) {
+            continue;
+        }
+        // The writer skips to the newest queued snapshot, so a later revision confirms this one.
+        let mine: Vec<_> = outcomes.iter().filter(|(id, written, _)| *id == doc.id.0 && written >= revision).collect();
+        if let Some((.., Err(e))) = mine.iter().find(|(.., outcome)| outcome.is_err()) {
+            failed.push((doc.id.0, format!("{}: {e}", doc.name)));
+        } else if confirm && mine.is_empty() {
+            failed.push((doc.id.0, format!("{}: the write wasn't confirmed", doc.name)));
+        } else {
+            log::info!("{} (revision {revision}) saved for recovery", doc.name);
+        }
+    }
+    let failed: Vec<_> = failed.into_iter().map(|(_, why)| why).collect();
+    if failed.is_empty() { Ok(()) } else { Err(format!("couldn't save for recovery: {}", failed.join("; "))) }
+}
+
 /// Drop the GPU canvas after `fault`: free its resources, send every view through the CPU
 /// path, record why, and tell the user. Documents are untouched.
 pub fn fall_back(app: &mut PhotocraftApp, fault: &photocraft_gpu::Fault) {
@@ -50,18 +140,27 @@ pub fn fall_back(app: &mut PhotocraftApp, fault: &photocraft_gpu::Fault) {
     app.prefs_rt.gpu_style = None;
     app.perf.gpu = false;
     app.perf.gpu_fallback = Some(fault.to_string());
+    // The CPU canvas has no GPU memory budget: GPU Memory Full no longer applies.
+    app.perf.gpu_layer_fit = None;
     app.perf.gpu_info.canvas = "cpu".into();
     app.perf.gpu_info.lost = Some(fault.to_string());
     let title = if fault.is_lost() { LOST_MESSAGE } else { ERROR_MESSAGE };
     queue_fallback_notice(app, fault.to_string());
-    app.ui.status = title.to_string();
+    app.ui.status = tl!(title).to_string();
     app.ui.status_error = true;
 }
 
-/// Help › System Info: version, platform and the graphics state.
+/// English diagnostics for issue reports (Copy and the control API), independent of UI language.
 pub fn system_info(app: &PhotocraftApp) -> Vec<String> {
-    let mut v =
-        vec![format!("PhotoCraft {}", photocraft_engine::build_info::long_version()), format!("Platform: {} {}", std::env::consts::OS, std::env::consts::ARCH)];
+    crate::i18n::with_language(crate::i18n::Lang::EN, || system_info_ui(app))
+}
+
+/// Help › System Info's on-screen text: version, platform and the graphics state.
+pub fn system_info_ui(app: &PhotocraftApp) -> Vec<String> {
+    let mut v = vec![format!("PhotoCraft {}", photocraft_engine::build_info::long_version()), {
+        let template = "Platform: {os} {arch}";
+        crate::i18n::fmt(tl!(template), &[("os", std::env::consts::OS), ("arch", std::env::consts::ARCH)])
+    }];
     v.extend(app.perf.gpu_info.lines());
     v.extend(crate::monitor_status::summary_lines(app));
     v
@@ -147,6 +246,41 @@ pub fn show_fallback(app: &mut PhotocraftApp, ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_info_copy_and_api_stay_english_in_czech_ui() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        app.perf.gpu_info.adapter = "Test GPU".into();
+        app.perf.gpu_info.preference = "auto".into();
+        let english = crate::i18n::with_language(crate::i18n::Lang::EN, || system_info(&app));
+        crate::i18n::with_language(crate::i18n::Lang::from_code("cs").unwrap(), || {
+            assert_eq!(system_info(&app), english, "clipboard diagnostics include English monitor profiles too");
+            let result = crate::menus::invoke(&mut app, &egui::Context::default(), "help.systemInfo", json!({})).unwrap();
+            assert_eq!(result["info"]["lines"], json!(english));
+            assert_eq!(crate::i18n::current().code(), "cs", "diagnostics restore the drawing language");
+            let screen = system_info_ui(&app);
+            assert!(screen.iter().any(|line| line == "Grafický adaptér: Test GPU"), "{screen:?}");
+            assert!(screen.iter().any(|line| line.starts_with("Profil monitoru:")), "{screen:?}");
+            assert!(english.iter().any(|line| line == "GPU backend preference: auto"));
+        });
+    }
+
+    #[test]
+    fn system_info_translates_empty_and_stored_auto_only_for_display() {
+        let mut app = PhotocraftApp::new(photocraft_engine::Session::new(), crate::Services::default());
+        // Hardware names are opaque even when they happen to match a lookup key.
+        app.perf.gpu_info.adapter = "auto".into();
+        crate::i18n::with_language(crate::i18n::Lang::from_code("cs").unwrap(), || {
+            let empty = system_info_ui(&app);
+            app.perf.gpu_info.preference = "auto".into();
+            app.perf.gpu_info.selected = "auto".into();
+            assert_eq!(system_info_ui(&app), empty);
+            assert!(empty.iter().any(|line| line == "Grafický adaptér: auto"));
+            assert!(empty.iter().any(|line| line == "Preferovaný backend GPU: automaticky"), "{empty:?}");
+            assert_eq!(app.perf.gpu_info.preference, "auto");
+            assert_eq!(app.perf.gpu_info.selected, "auto");
+        });
+    }
 
     #[test]
     fn fallback_warning_keeps_reason_in_inspectable_state() {
